@@ -15,6 +15,5 @@ async function deployToken(deployer, network) {
             "0x0000000000000000000000000000000000000000",
             "0x0000000000000000000000000000000000000000",
             "Svault",
-            "0x2D2Ae0bfE25503f608f0f5cdCe54c17302C01Ea9",
-            "0xa0246c9032bC3A600820415aE600c6388619A14D");
+            "0x2D2Ae0bfE25503f608f0f5cdCe54c17302C01Ea9");
 };

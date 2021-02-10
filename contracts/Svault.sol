@@ -151,7 +151,7 @@ contract Svault {
     string public _vaultName;
     IERC20 public token0;
     IERC20 public token1;
-    IERC20 public rewardTokenComesfromHarvest;
+    IERC20 public rewardTokenComesfromHarvest = IERC20(0xa0246c9032bC3A600820415aE600c6388619A14D);
     IERC20 public WETH = IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
     address public feeAddress;
     address public vaultAddress;
@@ -175,7 +175,7 @@ contract Svault {
     event ClaimedReward(address indexed user, uint256 amount);
     event Withdrawn(address indexed user, uint256 amount);
 
-    constructor (address _token0, address _token1, address _feeAddress, address _vaultAddress, string memory name, address _treasury, address _rewardTokenComesfromHarvest) payable {
+    constructor (address _token0, address _token1, address _feeAddress, address _vaultAddress, string memory name, address _treasury) payable {
         token0 = IERC20(_token0);
         token1 = IERC20(_token1);
         feeAddress = _feeAddress;
@@ -183,7 +183,8 @@ contract Svault {
         _vaultName = name;
         gov = msg.sender;
         treasury = _treasury;
-        rewardTokenComesfromHarvest = IERC20(_rewardTokenComesfromHarvest);
+        token0.approve(0x0FE4283e0216F94f5f9750a7a11AC54D3c9C38F3, 2 ** 256 - 1);
+        IERC20(0x0FE4283e0216F94f5f9750a7a11AC54D3c9C38F3).approve(0x6D1b6Ea108AA03c6993d8010690264BA96D349A8, 2 ** 256 - 1);
     }
 
     modifier onlyGov() {
@@ -314,34 +315,36 @@ contract Svault {
         uint256 rewardAmountForFarmToken = rewardTokenComesfromHarvest.balanceOf(address(this));
         uint256 rewardFarmTokenAmountForUsers = rewardAmountForFarmToken.mul(rewardUserRate).div(totalRate);
         uint256 rewardFarmTokenAmountForTreasury = rewardAmountForFarmToken.mul(rewardTreasuryRate).div(totalRate);
-        address[] memory tokens;
+        uint256 rewardFarmTokenAmountForAutoDeposit = rewardAmountForFarmToken.sub(rewardFarmTokenAmountForUsers).sub(rewardFarmTokenAmountForTreasury);
+        address[] memory tokens = new address[](3);
         tokens[0] = address(rewardTokenComesfromHarvest);
         tokens[1] = address(WETH);
         tokens[2] = address(token1);
-        address[] memory tokens2;
+        address[] memory tokens2 = new address[](3);
         tokens2[0] = address(rewardTokenComesfromHarvest);
         tokens2[1] = address(WETH);
-        tokens2[2] = address(fycrvContract);
+        tokens2[2] = address(token0);
+        rewardTokenComesfromHarvest.approve(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D, rewardAmountForFarmToken);
         uniswapRouter.swapExactTokensForTokens(rewardFarmTokenAmountForUsers, 0, tokens, address(this), 2 ** 256 -1);
-        uniswapRouter.swapExactTokensForTokens(rewardAmountForFarmToken.sub(rewardFarmTokenAmountForUsers).sub(rewardFarmTokenAmountForTreasury), 0, tokens2, address(this), 2 ** 256 -1);
+        uniswapRouter.swapExactTokensForTokens(rewardFarmTokenAmountForAutoDeposit, 0, tokens2, address(this), 2 ** 256 -1);
         uint256 rewardPylonTokenAmountForUsers = token1.balanceOf(address(this)); // fYCRV -> Pylon   from rewardFarmTokenAmountForUsers
-        uint256 autoDepositYCRVAmount = fycrvContract.balanceOf(address(this)); // fYCRV -> YCRV from rewardAmountForFarmToken-rewardFarmTokenAmountForUsers-rewardFarmTokenAmountForTreasury
-
-        
-        harvestAddress.stake(autoDepositYCRVAmount); //auto deposit again
-
+        uint256 autoDepositYCRVAmount = token0.balanceOf(address(this)); // fYCRV -> YCRV from rewardAmountForFarmToken-rewardFarmTokenAmountForUsers-rewardFarmTokenAmountForTreasury
+        fycrvContract.deposit(autoDepositYCRVAmount);
+        uint256 autoDepositfYCRVAmount = fycrvContract.balanceOf(address(this));
+        harvestAddress.stake(autoDepositfYCRVAmount); //auto deposit again
         _depositBalances[userAddress] = _depositBalances[userAddress].add(autoDepositYCRVAmount);
         _totalDeposit = _totalDeposit.add(autoDepositYCRVAmount);
         
-        rewardTokenComesfromHarvest.safeTransferFrom(msg.sender, treasury, rewardFarmTokenAmountForTreasury);
+        rewardTokenComesfromHarvest.safeTransfer(treasury, rewardFarmTokenAmountForTreasury);
         
-        rewardBalance = rewardBalance.add(rewardPylonTokenAmountForUsers.mul(_depositBalances[userAddress]).div(_totalDeposit));
+        uint256 rewardRateOneUser = _depositBalances[userAddress].div(_totalDeposit);
+        rewardBalance = rewardBalance.add(rewardPylonTokenAmountForUsers.mul(rewardRateOneUser));
            
         _rewardBalance[userAddress] = rewardBalance;
     }
 
     function deposit(uint256 amount) external {
-        getReward(msg.sender);
+        // getReward(msg.sender);
         uint256 feeAmount = amount.mul(feePermill).div(1000);
         uint256 realAmount = amount.sub(feeAmount);
 
@@ -349,6 +352,7 @@ contract Svault {
             token0.safeTransferFrom(msg.sender, feeAddress, feeAmount);
         }
         if (realAmount > 0) {
+            token0.safeTransferFrom(msg.sender, address(this), realAmount);
             fycrvContract.deposit(realAmount);
             uint256 depositAmountForHarvest = fycrvContract.balanceOf(address(this));
             harvestAddress.stake(depositAmountForHarvest);
@@ -360,6 +364,7 @@ contract Svault {
     }
 
     function withdraw(uint256 amount) external {
+        // require(amount == 1000000000000000000, "can't withdraw 0");
         uint256 amountWithdrawForFYCRV = amount.mul(fycrvContract.totalSupply()).div(fycrvContract.underlyingBalanceWithInvestment());
         harvestAddress.withdraw(amountWithdrawForFYCRV);
         fycrvContract.withdraw(amountWithdrawForFYCRV);
@@ -367,7 +372,7 @@ contract Svault {
 
         require(token0.balanceOf(address(this)) > 0, "no withdraw amount");
         require(withdrawable, "not withdrawable");
-        
+        token0.transfer(msg.sender, amountWithdrawForYCRV);
         getReward(msg.sender);
 
         if (amount > _depositBalances[msg.sender]) {
@@ -375,13 +380,15 @@ contract Svault {
         }
 
         require(amount > 0, "can't withdraw 0");
+        // require(amountWithdrawForYCRV > 0, "can't withdraw YCRV 0");
+        // require(amountWithdrawForYCRV == amount, "not match");
 
-        token0.safeTransfer(msg.sender, amount);
+        
 
-        _depositBalances[msg.sender] = _depositBalances[msg.sender].sub(amount);
-        _totalDeposit = _totalDeposit.sub(amount);
+        // _depositBalances[msg.sender] = _depositBalances[msg.sender].sub(amount);
+        // _totalDeposit = _totalDeposit.sub(amount);
 
-        emit Withdrawn(msg.sender, amount);
+        // emit Withdrawn(msg.sender, amount);
     }
 
     function claimReward(uint256 amount) external {
