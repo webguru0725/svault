@@ -13,33 +13,27 @@ interface IERC20 {
     event Approval(address indexed owner, address indexed spender, uint value);
 }
 
-interface NoMintRewardPool {
-    function getReward() external;
-    function stake(uint amount) external;
-    function withdraw(uint amount) external;
-}
-
-interface VaultProxy {
-    function approve(address spender, uint amount) external returns (bool);
-    function deposit(uint amount) external;
-    function withdraw(uint amount) external;
-    function balanceOf(address account) external returns (uint);
-    function underlyingBalanceWithInvestment() external returns (uint);
-    function totalSupply() external returns (uint);
-}
-
 interface UniswapRouter {
     function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory);
+}
+
+interface YCrvGauge {
+    function deposit(uint256 amount) external;
+    function withdraw(uint256 amount) external;
+}
+
+interface TokenMinter {
+    function mint(address account) external;
 }
 
 contract Svault {
 
     IERC20 constant WETH = IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
-    NoMintRewardPool constant HARVESTPOOL = NoMintRewardPool(0x6D1b6Ea108AA03c6993d8010690264BA96D349A8);
-    VaultProxy constant FYCRV = VaultProxy(0x0FE4283e0216F94f5f9750a7a11AC54D3c9C38F3);
-    IERC20 constant FARM = IERC20(0xa0246c9032bC3A600820415aE600c6388619A14D);
     UniswapRouter constant UNIROUTER = UniswapRouter(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+    YCrvGauge constant YCRVGAUGE = YCrvGauge(0xFA712EE4788C042e2B7BB55E6cb8ec569C4530c1);
+    TokenMinter constant TOKENMINTER = TokenMinter(0xd061D61a4d941c39E5453435B6345Dc261C2fcE0);
     uint32 constant TOTALRATE = 10000;
+    IERC20 constant CRV = IERC20(0xD533a949740bb3306d119CC777fa900bA034cd52);
     
     mapping(address => uint) public rewardedBalancePerUser;
     mapping(address => uint) public lastTimestampPerUser;
@@ -55,7 +49,6 @@ contract Svault {
     IERC20 public token0;
     IERC20 public token1;
 
-
     address public feeAddress;
 
     uint32 public feeRate;
@@ -64,7 +57,7 @@ contract Svault {
 
 
     uint32 public rewardUserRate = 7000;
-    uint32 public rewardTreasuryRate = 1500;
+    uint32 public rewardTreasuryRate = 3000;
 
     
     address public gov;
@@ -80,9 +73,8 @@ contract Svault {
         vaultName = name;
         gov = msg.sender;
         treasury = _treasury;
-        token0.approve(address(FYCRV), type(uint).max);
-        FYCRV.approve(address(HARVESTPOOL), type(uint).max);
-        FARM.approve(address(UNIROUTER), type(uint).max);
+        token0.approve(address(YCRVGAUGE), type(uint).max);
+        CRV.approve(address(UNIROUTER), type(uint).max);
     }
 
     modifier onlyGov() {
@@ -170,46 +162,30 @@ contract Svault {
 
     function getReward() internal
     {
-        uint rewardAmountForFarmToken = FARM.balanceOf(address(this));
-        HARVESTPOOL.getReward();
-        rewardAmountForFarmToken = FARM.balanceOf(address(this)) - rewardAmountForFarmToken;
-        uint rewardFarmTokenAmountForUsers = rewardAmountForFarmToken * rewardUserRate / TOTALRATE;
-        uint rewardFarmTokenAmountForTreasury = rewardAmountForFarmToken * rewardTreasuryRate / TOTALRATE;
-        uint rewardFarmTokenAmountForAutoDeposit = rewardAmountForFarmToken - rewardFarmTokenAmountForUsers - rewardFarmTokenAmountForTreasury;
+        uint rewardAmountForCRVToken = CRV.balanceOf(address(this));
+        TOKENMINTER.mint(address(YCRVGAUGE));
+        rewardAmountForCRVToken = CRV.balanceOf(address(this)) - rewardAmountForCRVToken;
+        uint rewardCRVTokenAmountForUsers = rewardAmountForCRVToken * rewardUserRate / TOTALRATE;
+        uint rewardCRVTokenAmountForTreasury = rewardAmountForCRVToken * rewardTreasuryRate / TOTALRATE;
         address[] memory tokens = new address[](3);
-        tokens[0] = address(FARM);
+        tokens[0] = address(CRV);
         tokens[1] = address(WETH);
         tokens[2] = address(token1);
         address[] memory tokens1 = new address[](2);
-        tokens[0] = address(FARM);
-        tokens[1] = address(WETH);
-        address[] memory tokens2 = new address[](3);
-        tokens2[0] = address(FARM);
-        tokens2[1] = address(WETH);
-        tokens2[2] = address(token0);
+        tokens1[0] = address(CRV);
+        tokens1[1] = address(WETH);
         uint rewardPylonTokenAmountForUsers = token1.balanceOf(address(this));
-        uint autoDepositYCRVAmount = token0.balanceOf(address(this));
-        if (rewardFarmTokenAmountForUsers > 0) {
-            UNIROUTER.swapExactTokensForTokens(rewardFarmTokenAmountForUsers, 0, tokens, address(this), type(uint).max);
-        }
-        if (rewardFarmTokenAmountForTreasury > 0) {
-            UNIROUTER.swapExactTokensForTokens(rewardFarmTokenAmountForTreasury, 0, tokens1, address(this), type(uint).max);
-        }
-        if (rewardFarmTokenAmountForAutoDeposit > 0) {
-            UNIROUTER.swapExactTokensForTokens(rewardFarmTokenAmountForAutoDeposit, 0, tokens2, address(this), type(uint).max);
-        }
-        rewardPylonTokenAmountForUsers = token1.balanceOf(address(this)) - rewardPylonTokenAmountForUsers; // fYCRV -> Pylon   from rewardFarmTokenAmountForUsers
-        autoDepositYCRVAmount = token0.balanceOf(address(this)) - autoDepositYCRVAmount; // fYCRV -> YCRV from rewardAmountForFarmToken-rewardFarmTokenAmountForUsers-rewardFarmTokenAmountForTreasury
-        uint autoDepositfYCRVAmount = 0;
-        if (autoDepositYCRVAmount > 0) {
-            autoDepositfYCRVAmount = FYCRV.balanceOf(address(this));
-            FYCRV.deposit(autoDepositYCRVAmount);
-            autoDepositfYCRVAmount = FYCRV.balanceOf(address(this)) - autoDepositfYCRVAmount;
-        }
-        if (autoDepositfYCRVAmount > 0) {
-            HARVESTPOOL.stake(autoDepositfYCRVAmount);
+        if (rewardCRVTokenAmountForUsers > 0) {
+            UNIROUTER.swapExactTokensForTokens(rewardCRVTokenAmountForUsers, 0, tokens, address(this), type(uint).max);
         }
         uint wethBalance = WETH.balanceOf(address(this));
+        if (rewardCRVTokenAmountForTreasury > 0) {
+            UNIROUTER.swapExactTokensForTokens(rewardCRVTokenAmountForTreasury, 0, tokens1, address(this), type(uint).max);
+        }
+    
+        rewardPylonTokenAmountForUsers = token1.balanceOf(address(this)) - rewardPylonTokenAmountForUsers; // fYCRV -> Pylon   from rewardFarmTokenAmountForUsers
+        accTotalReward += rewardPylonTokenAmountForUsers;
+        wethBalance = WETH.balanceOf(address(this)) - wethBalance;
         if (wethBalance > 0) {
             WETH.transfer(treasury, wethBalance);
         }
@@ -217,8 +193,8 @@ contract Svault {
 
     function deposit(uint amount) external updateBalance(msg.sender) {
         getReward();
-
-        uint feeAmount = amount * feeRate / 10000;
+        // minimum fee 0.01%
+        uint feeAmount = amount * feeRate / TOTALRATE;
         uint realAmount = amount - feeAmount;
 
         if (feeAmount > 0) {
@@ -227,9 +203,7 @@ contract Svault {
         
         if (realAmount > 0) {
             token0.transferFrom(msg.sender, address(this), realAmount);
-            FYCRV.deposit(realAmount);
-            uint depositAmountForHarvest = FYCRV.balanceOf(address(this));
-            HARVESTPOOL.stake(depositAmountForHarvest);
+            YCRVGAUGE.deposit(realAmount);
             depositBalancePerUser[msg.sender] += realAmount;
             totalDeposit += realAmount;
             emit Deposited(msg.sender, realAmount);
@@ -238,20 +212,14 @@ contract Svault {
 
     function withdraw(uint amount) external updateBalance(msg.sender) {
         getReward();
-
-        uint amountWithdrawForFYCRV = amount * FYCRV.totalSupply() / FYCRV.underlyingBalanceWithInvestment();
-        HARVESTPOOL.withdraw(amountWithdrawForFYCRV);
-        FYCRV.withdraw(amountWithdrawForFYCRV);
-        uint amountWithdrawForYCRV = token0.balanceOf(address(this));
-        require(amountWithdrawForYCRV > 0, "no withdraw amount");
-        token0.transfer(msg.sender, amountWithdrawForYCRV);
-        
         uint depositBalance = depositBalancePerUser[msg.sender];
         if (amount > depositBalance) {
             amount = depositBalance;
         }
-
-        require(amount > 0, "can't withdraw 0");
+        uint amountWithdrawForYCRV = token0.balanceOf(address(this));
+        YCRVGAUGE.withdraw(amount);
+        amountWithdrawForYCRV = token0.balanceOf(address(this)) - amountWithdrawForYCRV;
+        token0.transfer(msg.sender, amountWithdrawForYCRV);
         
         depositBalancePerUser[msg.sender] = depositBalance - amountWithdrawForYCRV;
         totalDeposit -= amountWithdrawForYCRV;
@@ -275,11 +243,12 @@ contract Svault {
         }
         if (reward > 0) {
             token1.transfer(msg.sender, reward);
+            emit ClaimedReward(msg.sender, reward);
         }
     }
 
     function seize(address token, address to) external onlyGov {
-        require(IERC20(token) != token0 && IERC20(token) != token1, "main tokens");
+        require(IERC20(token) != token1, "main tokens");
         if (token != address(0)) {
             uint amount = IERC20(token).balanceOf(address(this));
             IERC20(token).transfer(to, amount);
