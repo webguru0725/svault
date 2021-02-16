@@ -15,15 +15,37 @@ interface IERC20 {
 
 interface UniswapRouter {
     function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory);
+    function getAmountsOut(uint amountIn, address[] memory path) external view returns (uint[] memory amounts);
 }
 
 interface YCrvGauge {
     function deposit(uint256 amount) external;
     function withdraw(uint256 amount) external;
+    function integrate_fraction(address account) external view returns (uint256);
+    function user_checkpoint(address account) external returns (bool);
+    function crv_token() external view returns (address);
+    function controller() external view returns (address);
+    function period() external view returns (uint256);
+    function period_timestamp(uint256 amount) external view returns (uint256);
+    function integrate_inv_supply(uint256 amount) external view returns (uint256);
+    function integrate_inv_supply_of(address account) external view returns (uint256);
+    function inflation_rate() external view returns (uint256);
+    function future_epoch_time() external view returns (uint256);
+    function working_balances(address account) external view returns (uint256);
+    function working_supply() external view returns (uint256);
+}
+
+interface Controller {
+    function gauge_relative_weight(address account, uint256 time) external view returns (uint256);
+}
+
+interface CRV20 {
+    function rate() external view returns (uint256);
 }
 
 interface TokenMinter {
     function mint(address account) external;
+    function minted(address account, address guage) external view returns (uint256);
 }
 
 contract Svault {
@@ -34,6 +56,7 @@ contract Svault {
     TokenMinter constant TOKENMINTER = TokenMinter(0xd061D61a4d941c39E5453435B6345Dc261C2fcE0);
     uint32 constant TOTALRATE = 10000;
     IERC20 constant CRV = IERC20(0xD533a949740bb3306d119CC777fa900bA034cd52);
+    uint256 constant WEEK = 604800;
     
     mapping(address => uint) public rewardedBalancePerUser;
     mapping(address => uint) public lastTimestampPerUser;
@@ -44,6 +67,7 @@ contract Svault {
     uint public accTotalReward;
     uint public totalDeposit;
     uint public accTotalDeposit;
+    uint public totalDepositForAPY;
 
     string public vaultName;
     IERC20 public token0;
@@ -80,6 +104,16 @@ contract Svault {
     modifier onlyGov() {
         require(msg.sender == gov, "!governance");
         _;
+    }
+
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        // Solidity only automatically asserts when dividing by 0
+        if(a > b)
+        {
+            return b;
+        }else{
+            return a;
+        }
     }
 
     modifier updateBalance(address userAddress) {
@@ -191,9 +225,61 @@ contract Svault {
         }
     }
 
+    function getRewardAmount(address userAddress) public view returns (uint256) {
+        uint256 _period = YCRVGAUGE.period();
+        uint256 _period_time = YCRVGAUGE.period_timestamp(_period);
+        uint256 _integrate_inv_supply = YCRVGAUGE.integrate_inv_supply(_period);
+        uint256 rate = YCRVGAUGE.inflation_rate();
+        uint256 new_rate = rate;
+        uint256 prev_future_epoch = YCRVGAUGE.future_epoch_time();
+        if (prev_future_epoch >= _period_time)
+        {
+            new_rate = CRV20(YCRVGAUGE.crv_token()).rate();
+        }
+        uint256 _working_balance = YCRVGAUGE.working_balances(address(this));
+        uint256 _working_supply = YCRVGAUGE.working_supply();
+
+        if (block.timestamp > _period_time)
+        {
+            uint256 prev_week_time = _period_time;
+            uint256 week_time = min((_period_time + WEEK) / WEEK * WEEK, block.timestamp);
+            for(uint i; i < 500; i++)
+            {
+                uint256 dt = week_time - prev_week_time;
+                uint256 w = Controller(YCRVGAUGE.controller()).gauge_relative_weight(address(YCRVGAUGE), prev_week_time / WEEK * WEEK);
+          
+                if (prev_future_epoch >= prev_week_time && prev_future_epoch < week_time)
+                {
+                    _integrate_inv_supply += rate * w * (prev_future_epoch - prev_week_time) / _working_supply;
+                    rate = new_rate;
+                    _integrate_inv_supply += rate * w * (week_time - prev_future_epoch) / _working_supply;
+                }
+                else{
+                    _integrate_inv_supply += rate * w * dt / _working_supply;
+                }
+                if (week_time == block.timestamp) break;
+                prev_week_time = week_time;
+                week_time = min(week_time + WEEK, block.timestamp);
+            }
+        }
+        _period += 1;
+        uint256 integrate_fraction = YCRVGAUGE.integrate_fraction(address(this));
+        integrate_fraction += _working_balance * (_integrate_inv_supply - YCRVGAUGE.integrate_inv_supply_of(address(this))) / 10 ** 18;
+        uint rewardAmountForCRVToken = integrate_fraction - TOKENMINTER.minted(address(this), address(YCRVGAUGE));
+
+        uint rewardCRVTokenAmountForUsers = rewardAmountForCRVToken * rewardUserRate / TOTALRATE;
+        address[] memory tokens = new address[](3);
+        tokens[0] = address(CRV);
+        tokens[1] = address(WETH);
+        tokens[2] = address(token1);
+        uint[] memory availablePylonRewardAmountsForUsers = new uint[](3);
+        availablePylonRewardAmountsForUsers = UNIROUTER.getAmountsOut(rewardCRVTokenAmountForUsers, tokens);
+        uint256 availablePylonRewardAmountForUsers = availablePylonRewardAmountsForUsers[2];
+        uint256 availablePylonRewardAmountForUser = availablePylonRewardAmountForUsers * accDepositBalancePerUser[userAddress] / accTotalDeposit;
+        return availablePylonRewardAmountForUser;
+    }
+
     function deposit(uint amount) external updateBalance(msg.sender) {
-        getReward();
-        // minimum fee 0.01%
         uint feeAmount = amount * feeRate / TOTALRATE;
         uint realAmount = amount - feeAmount;
 
@@ -206,12 +292,12 @@ contract Svault {
             YCRVGAUGE.deposit(realAmount);
             depositBalancePerUser[msg.sender] += realAmount;
             totalDeposit += realAmount;
+            totalDepositForAPY += realAmount;
             emit Deposited(msg.sender, realAmount);
         }
     }
 
     function withdraw(uint amount) external updateBalance(msg.sender) {
-        getReward();
         uint depositBalance = depositBalancePerUser[msg.sender];
         if (amount > depositBalance) {
             amount = depositBalance;
